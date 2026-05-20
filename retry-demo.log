@@ -1,0 +1,23 @@
+
+=== scenario 1: harness returns 502, 502, 200 — retry recovers ===
+retryFetch[demo:create_session] attempt 1/3 retrying after 3ms (reason: HTTP 502)
+retryFetch[demo:create_session] attempt 2/3 retrying after 391ms (reason: HTTP 502)
+  final status: 200
+  body: {"id":"sess_demo"}
+  total upstream attempts: 3
+
+=== scenario 2: connect refused on closed port — retry, then surface ===
+retryFetch[demo:dead_port] attempt 1/3 retrying after 19ms (reason: ECONNREFUSED)
+retryFetch[demo:dead_port] attempt 2/3 retrying after 35ms (reason: ECONNREFUSED)
+  threw after retries (expected): isConnectError=true
+  err.message: fetch failed
+
+=== scenario 3: 404 caller-error — must NOT retry ===
+  final status: 404
+  total upstream attempts: 1  (must be 1)
+
+=== scenario 4: POST /message — connect retry only, 5xx surfaces ===
+  final status: 502
+  total upstream attempts: 1  (must be 1 — no 5xx retry)
+
+all scenarios complete.
