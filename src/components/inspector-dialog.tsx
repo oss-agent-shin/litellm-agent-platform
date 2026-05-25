@@ -8,6 +8,11 @@
  *
  *   platform pane  ← GET /api/v1/.../events  (wrapped envelope)
  *   harness pane   ← GET /api/v1/.../stream  (pure passthrough)
+ *
+ * A small "sandbox config" strip at the top lists what's actually wired
+ * onto the opencode sandbox for this session — MCP servers and attached
+ * skills — so the operator can answer "what does this agent have?"
+ * without leaving the session page.
  */
 
 import {
@@ -17,10 +22,17 @@ import {
   useRef,
   useState,
 } from "react";
-import { Activity, X } from "lucide-react";
+import { Activity, Boxes, ChevronRight, Plug, X } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
-import { getStoredMasterKey } from "@/lib/api";
+import {
+  getSkill,
+  getStoredMasterKey,
+  listMcps,
+  type AgentRow,
+  type McpRow,
+  type SkillRow,
+} from "@/lib/api";
 
 type BusEvent = {
   id?: string;
@@ -400,14 +412,206 @@ function writeHarnessPref(v: boolean): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Sandbox config strip
+// ---------------------------------------------------------------------------
+
+/**
+ * Collapsible strip rendered between the inspector header and the event
+ * toolbar. Lists what's actually wired onto the opencode sandbox for this
+ * session — MCP servers and skills attached to the agent driving it. Both
+ * enrichments (MCP catalog lookup, skill name/description) are best-effort:
+ * a failed lookup degrades to the bare id so the user still sees what's set.
+ *
+ * Renders nothing when the agent has no MCPs and no skills attached — an
+ * empty strip is visual noise on bare agents.
+ */
+function SandboxConfigStrip({ agent }: { agent: AgentRow | null }) {
+  const [collapsed, setCollapsed] = useState(false);
+
+  // Memoize so the catalog/skill effects below don't re-fire on every
+  // parent render (the AgentRow object identity isn't stable across reloads
+  // but the arrays it contains are conceptually immutable per agent_id).
+  const mcpIds = useMemo(() => agent?.mcp_servers ?? [], [agent?.mcp_servers]);
+  const skillIds = useMemo(
+    () => agent?.attached_skill_ids ?? [],
+    [agent?.attached_skill_ids],
+  );
+
+  const [mcpCatalog, setMcpCatalog] = useState<McpRow[]>([]);
+  // Pull the global MCP catalog once when this agent actually has MCPs
+  // attached. Empty-MCP agents skip the fetch entirely.
+  useEffect(() => {
+    if (mcpIds.length === 0) return;
+    let cancelled = false;
+    listMcps()
+      .then((rows) => {
+        if (!cancelled) setMcpCatalog(rows);
+      })
+      .catch(() => {
+        /* Catalog fetch is best-effort — rows just render with bare id. */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mcpIds]);
+
+  // Resolve each attached skill_id to its name/description. We fetch in
+  // parallel and ignore individual failures so a single missing skill
+  // doesn't blank the whole list.
+  const [skills, setSkills] = useState<Map<string, SkillRow>>(new Map());
+  useEffect(() => {
+    if (skillIds.length === 0) return;
+    let cancelled = false;
+    void Promise.all(
+      skillIds.map((id) =>
+        getSkill(id)
+          .then((s) => [id, s] as const)
+          .catch(() => null),
+      ),
+    ).then((rows) => {
+      if (cancelled) return;
+      const next = new Map<string, SkillRow>();
+      for (const r of rows) {
+        if (r) next.set(r[0], r[1]);
+      }
+      setSkills(next);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [skillIds]);
+
+  // Build an index keyed by both server_id and server_name so callers can
+  // hit either — `agent.mcp_servers` is just an opaque string[] and the
+  // catalog rows distinguish the two.
+  const catalogByKey = useMemo(() => {
+    const m = new Map<string, McpRow>();
+    for (const r of mcpCatalog) {
+      m.set(r.server_id, r);
+      if (r.server_name) m.set(r.server_name, r);
+    }
+    return m;
+  }, [mcpCatalog]);
+
+  // Empty agent → nothing to show. Don't render an empty bordered strip.
+  if (agent && mcpIds.length === 0 && skillIds.length === 0) return null;
+
+  return (
+    <div className="border-b border-gray-200 bg-gray-50/40 text-[11px]">
+      <button
+        type="button"
+        onClick={() => setCollapsed((v) => !v)}
+        className="w-full flex items-center gap-2 px-4 py-2 text-left hover:bg-gray-100/80 transition-colors"
+      >
+        <ChevronRight
+          className={`size-3 text-gray-400 transition-transform ${
+            collapsed ? "" : "rotate-90"
+          }`}
+        />
+        <span className="font-medium text-gray-700">sandbox config</span>
+        <span className="ml-auto font-mono text-gray-400">
+          {mcpIds.length} mcp · {skillIds.length} skill
+          {skillIds.length === 1 ? "" : "s"}
+        </span>
+      </button>
+      {!collapsed && (
+        <div className="px-4 pb-3 pt-1 flex flex-col gap-3">
+          <ConfigGroup
+            icon={<Plug className="size-3 text-gray-500" />}
+            label="MCP servers"
+            empty="no MCP servers attached"
+            items={
+              mcpIds.length === 0
+                ? null
+                : mcpIds.map((id) => {
+                    const row = catalogByKey.get(id);
+                    const name = row?.server_name || row?.alias || id;
+                    const detail = row?.url
+                      ? `${row.transport ?? "http"} · ${row.url}`
+                      : row?.description || id;
+                    return { key: id, name, detail };
+                  })
+            }
+          />
+          <ConfigGroup
+            icon={<Boxes className="size-3 text-gray-500" />}
+            label="Skills"
+            empty="no skills attached"
+            items={
+              skillIds.length === 0
+                ? null
+                : skillIds.map((id) => {
+                    const s = skills.get(id);
+                    return {
+                      key: id,
+                      name: s?.name ?? id,
+                      detail: s?.description ?? (s ? "" : "(loading…)"),
+                    };
+                  })
+            }
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface ConfigItem {
+  key: string;
+  name: string;
+  detail?: string;
+}
+
+function ConfigGroup({
+  icon,
+  label,
+  empty,
+  items,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  empty: string;
+  items: ConfigItem[] | null;
+}) {
+  return (
+    <div>
+      <div className="flex items-center gap-1.5 text-[10.5px] uppercase tracking-wide text-gray-500 mb-1.5">
+        {icon}
+        <span>{label}</span>
+      </div>
+      {!items || items.length === 0 ? (
+        <div className="pl-4 italic text-gray-400">{empty}</div>
+      ) : (
+        <ul className="flex flex-col gap-1 pl-4">
+          {items.map((it) => (
+            <li key={it.key} className="flex flex-col leading-tight">
+              <span className="font-mono text-gray-800 truncate">{it.name}</span>
+              {it.detail && (
+                <span className="font-mono text-[10px] text-gray-500 truncate">
+                  {it.detail}
+                </span>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 export function InspectorPanel({
   open,
   onClose,
   sessionId,
+  agent,
 }: {
   open: boolean;
   onClose: () => void;
   sessionId: string;
+  /** Agent driving this session. Optional so older callers still type-check;
+   *  null/undefined just hides the sandbox-config strip. */
+  agent?: AgentRow | null;
 }) {
   // Vault used to live in a sibling tab here; it was promoted to a
   // top-level session-header button (see VaultPanel in
@@ -481,6 +685,10 @@ export function InspectorPanel({
           <X className="size-4 text-gray-500" />
         </button>
       </header>
+
+      {/* What's wired onto this sandbox: MCPs + skills attached to the
+          agent. Self-hides when the agent has neither. */}
+      <SandboxConfigStrip agent={agent ?? null} />
 
       <div className="flex items-center gap-3 px-4 py-1.5 border-b border-gray-200 bg-gray-50/50 text-[11px]">
         <label className="inline-flex items-center gap-1.5 text-gray-600">
